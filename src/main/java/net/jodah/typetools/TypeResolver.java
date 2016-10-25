@@ -31,6 +31,7 @@ import java.lang.reflect.TypeVariable;
 import java.lang.reflect.WildcardType;
 import java.security.AccessController;
 import java.security.PrivilegedExceptionAction;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
@@ -686,37 +687,89 @@ public final class TypeResolver {
   }
 
   private static Member getMemberRef(Class<?> type) {
-    Object constantPool;
-    try {
-      constantPool = GET_CONSTANT_POOL.invoke(type);
-    } catch (Exception ignore) {
-      return null;
+    Member[] constantPoolMethods = extractConstantPoolMethods(type);
+    int start = constantPoolMethods.length;
+    if (isInstrumentedByJacoco(type)) {
+      for (int i = constantPoolMethods.length - 1; i >= 0; i--) {
+        if (constantPoolMethods[i].getName().startsWith("$jacoco")) {
+          start = i;
+        }
+      }
     }
 
     Member result = null;
-    for (int i = getConstantPoolSize(constantPool) - 1; i >= 0; i--) {
-      Member member = getConstantPoolMethodAt(constantPool, i);
+    for (int i = start - 1; i >= 0; i--) {
+      Member member = constantPoolMethods[i];
       // Skip SerializedLambda constructors and members of the "type" class
-      if (member == null
-          || (member instanceof Constructor
-              && member.getDeclaringClass().getName().equals("java.lang.invoke.SerializedLambda"))
-          || member.getDeclaringClass().isAssignableFrom(type))
+      if ((member instanceof Constructor
+          && member.getDeclaringClass().getName().equals("java.lang.invoke.SerializedLambda"))
+          || member.getDeclaringClass().equals(type))
         continue;
 
       result = member;
 
       // Return if not valueOf method
-      if (!(member instanceof Method) || !isAutoBoxingMethod((Method) member))
+      if (!(member instanceof Method) || !isBoxingOrUnboxingMethod((Method) member))
         break;
     }
 
     return result;
   }
 
-  private static boolean isAutoBoxingMethod(Method method) {
+  private static Member[] extractConstantPoolMethods(Class<?> type) {
+    Object constantPool;
+    try {
+      constantPool = GET_CONSTANT_POOL.invoke(type);
+    } catch (Exception ignore) {
+      return new Member[0];
+    }
+    ArrayList<Member> methods = new ArrayList<>();
+    for (int i = 0; i < getConstantPoolSize(constantPool); i++) {
+      Member method = getConstantPoolMethodAt(constantPool, i);
+      if (method != null)
+        methods.add(method);
+    }
+    return methods.toArray(new Member[methods.size()]);
+  }
+
+  static boolean isInstrumentedByJacoco(Class<?> type) {
+    // http://www.eclemma.org/jacoco/trunk/doc/faq.html
+    // JaCoCo [...] adds two members to the classes: A private static field $jacocoData and
+    // a private static method $jacocoInit(). Both members are marked as synthetic.
+    boolean result = false;
+    try {
+      type.getDeclaredMethod("$jacocoInit");
+      result = true;
+    } catch (NoSuchMethodException ignore) {
+    }
+    try {
+      type.getDeclaredField("$jacocoData");
+      result = true;
+    } catch (NoSuchFieldException ignore) {
+    }
+    return result;
+  }
+
+  private static boolean isBoxingOrUnboxingMethod(Method method) {
+    return isBoxingMethod(method) || isUnboxingMethod(method);
+  }
+
+  private static boolean isBoxingMethod(Method method) {
     Class<?>[] parameters = method.getParameterTypes();
     return method.getName().equals("valueOf") && parameters.length == 1 && parameters[0].isPrimitive()
         && wrapPrimitives(parameters[0]).equals(method.getDeclaringClass());
+  }
+
+  private static boolean isUnboxingMethod(Method method) {
+    String methodName = method.getName();
+    String returnType = method.getReturnType().getSimpleName();
+    Class<?>[] parameters = method.getParameterTypes();
+
+    return method.getReturnType().isPrimitive() && parameters.length == 0
+        //booleanValue, byteValue, charValue, doubleValue, floatValue, intValue, longValue, shortValue
+        && methodName.startsWith(returnType) && methodName.endsWith("Value")
+        && (wrapPrimitives(method.getReturnType()).equals(method.getDeclaringClass())
+        || method.getDeclaringClass().equals(Number.class));
   }
 
   private static Class<?> wrapPrimitives(Class<?> clazz) {
